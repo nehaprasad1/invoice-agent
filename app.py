@@ -46,7 +46,7 @@ class Err(Exception):
     def __init__(self, status, code): self.status, self.code = status, code
 
 def out(obj, status=200):
-    return Response(json.dumps(obj, separators=(",", ":")), status=status, media_type="application/a2a+json")
+    return Response(json.dumps(obj, separators=(",", ":")), status_code=status, media_type="application/a2a+json")
 
 @app.exception_handler(Err)
 async def _err(_, e):
