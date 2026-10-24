@@ -8,12 +8,13 @@ import hashlib, json, os, re, sqlite3, threading, time, uuid, urllib.request
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
+from starlette.concurrency import run_in_threadpool
 
 BASE_URL = os.environ.get("BASE_URL", "https://example.com/a2a").rstrip("/")
 BASE_PATH = "/" + BASE_URL.split("://", 1)[1].split("/", 1)[1] if BASE_URL.split("://", 1)[1].count("/") else ""
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.8-flash")
 DB_PATH = os.environ.get("DB_PATH", "agent.db")
 
 MT_BATCH = "application/vnd.ga5.invoice-claim-batch+json"
@@ -109,20 +110,20 @@ facts: vendorName, invoiceNumber (strings), amountMinor (integer minor units, e.
 rationale: 80-600 chars, name the action, and quote at least two of the evidence refs.
 Respond with ONLY JSON: {"decisions":[{"packageId":"...","action":"...","facts":{"vendorName":"","invoiceNumber":"","amountMinor":0,"currency":""},"evidenceRefs":["[..]","[..]","[..]"],"rationale":"..."}]}"""
 
-def llm(policy, pkgs):
-    body = {"model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"},
+def llm(policy, pkgs, model, timeout):
+    body = {"model": model, "temperature": 0, "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": SYSTEM},
                          {"role": "user", "content": "Policy revision: %s\nPackages (JSON):\n%s" % (policy, json.dumps(pkgs, ensure_ascii=False))}]}
     rq = urllib.request.Request(LLM_BASE_URL.rstrip("/") + "/chat/completions", data=json.dumps(body).encode(),
                                 headers={"Content-Type": "application/json", "Authorization": "Bearer " + LLM_API_KEY})
-    with urllib.request.urlopen(rq, timeout=38) as r:
+    with urllib.request.urlopen(rq, timeout=max(5, timeout)) as r:
         txt = json.load(r)["choices"][0]["message"]["content"]
     txt = re.sub(r"^```(?:json)?|```$", "", txt.strip()).strip()
     return {d["packageId"]: d for d in json.loads(txt)["decisions"]}
 
 def pkg_key(policy, pkg):
     c = {k: v for k, v in pkg.items() if k != "packageId"}
-    return sha(canon({"policy": policy, "pkg": c, "model": LLM_MODEL}))
+    return sha(canon({"policy": policy, "pkg": c}))
 
 def sanitize(d, pkg):
     text = canon(pkg)
@@ -152,18 +153,24 @@ def decide(batch):
             if r: found[p["packageId"]] = json.loads(r[0])
             else: todo.append(p)
     if todo:
-        got = {}
-        for _ in range(2):
+        models = [m.strip() for m in os.environ.get("LLM_MODELS", LLM_MODEL).split(",") if m.strip()]
+        deadline = time.time() + 40
+        got, attempt = {}, 0
+        while not got and time.time() < deadline - 6:
+            m = models[attempt % len(models)]
             try:
-                got = llm(policy, todo); break
+                got = llm(policy, todo, m, deadline - time.time())
             except Exception as e:
-                detail = e.read()[:400] if hasattr(e, "read") else ""
-                print("LLM ERROR:", repr(e), detail, flush=True)
-                time.sleep(0.5)
+                detail = e.read()[:300] if hasattr(e, "read") else ""
+                print("LLM ERROR:", m, repr(e), detail, flush=True)
+                time.sleep(1.5)
+            attempt += 1
+        if not got:
+            raise Err(503, "MODEL_UNAVAILABLE")
         for p in todo:
             dec = sanitize(got.get(p["packageId"], {}), p)
             found[p["packageId"]] = dec
-            if p["packageId"] in got:  # only cache real model answers
+            if p["packageId"] in got:
                 with dblock:
                     db.execute("INSERT OR REPLACE INTO decisions VALUES(?,?)", (keys[p["packageId"]], json.dumps(dec)))
     return found
@@ -226,7 +233,7 @@ def save_task(t, principal):
 async def send(req: Request):
     principal = check(req, post=True)
     raw = await req.body()
-    return handle_send(principal, raw)
+    return await run_in_threadpool(handle_send, principal, raw)
 
 def handle_send(principal, raw):
     try: body = json.loads(raw)
