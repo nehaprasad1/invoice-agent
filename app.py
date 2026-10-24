@@ -156,7 +156,7 @@ def decide(batch):
         for _ in range(2):
             try:
                 got = llm(policy, todo); break
-             except Exception as e:
+            except Exception as e:
                 detail = e.read()[:400] if hasattr(e, "read") else ""
                 print("LLM ERROR:", repr(e), detail, flush=True)
                 time.sleep(0.5)
